@@ -62,26 +62,115 @@ start_remote_listener() {
   ssh "$HOST" bash -s -- "$PORT" '$HOME/.labchatd.sh' <<<"$(listener_cmd)"
 }
 
-# ── the chat loop: tag outgoing lines, pipe through nc to the listener ───────
-chat_loop() {  # $1 = port to nc into (already reachable locally)
+# ── message display helpers ─────────────────────────────────────────────────
+# Parse incoming line: "[hostname] message" → display with formatting.
+# Uses dim for self (→), bold for others (←), with timestamps.
+display_message() {
+  local msg="$1"
+  [[ -z "$msg" ]] && return
+
+  if [[ "$msg" =~ ^\[([^]]+)\]\ (.+)$ ]]; then
+    local sender="${BASH_REMATCH[1]}"
+    local text="${BASH_REMATCH[2]}"
+    local ts
+    ts=$(date +%H:%M:%S)
+    if [[ "$sender" == "$NAME" ]]; then
+      printf '\e[2m[%s] → [%s] %s\e[0m\n' "$ts" "$sender" "$text"
+    else
+      printf '\e[2m[%s]\e[0m \e[1m← [%s]\e[0m %s\n' "$ts" "$sender" "$text"
+    fi
+  else
+    printf '\e[2m→ %s\e[0m\n' "$msg"
+  fi
+}
+
+# ── chat loop: proper dual I/O with readline ────────────────────────────────
+# $1 = port to nc into (already reachable locally)
+# $2 = ssh tunnel PID (optional, for cleanup)
+chat_loop() {
   local p="$1"
+  local tunnel_pid="${2:-}"
+  local send_fifo="" recv_fifo=""
+  local nc_pid=""
+  local cleanup_done=0
+
+  # Create two FIFOs: one for sending to remote, one for receiving
+  send_fifo=$(mktemp -u /tmp/labchat-send-XXXXXX)
+  recv_fifo=$(mktemp -u /tmp/labchat-recv-XXXXXX)
+  mkfifo "$send_fifo" "$recv_fifo"
+
+  # Cleanup handler (idempotent)
+  cleanup() {
+    [ "$cleanup_done" = "1" ] && return
+    cleanup_done=1
+    kill "$nc_pid" 2>/dev/null || true
+    kill "$tunnel_pid" 2>/dev/null || true
+    wait "$nc_pid" 2>/dev/null || true
+    rm -f "$send_fifo" "$recv_fifo"
+  }
+  trap cleanup INT TERM EXIT
+
   echo "── labchat: type to chat · /quit or Ctrl-C to leave ──"
-  { while IFS= read -r line; do
-      [ "$line" = "/quit" ] && break
-      printf '[%s] %s\n' "$NAME" "$line"
-    done } | nc 127.0.0.1 "$p"
+
+  # Open FIFOs as file descriptors
+  exec 3<"$recv_fifo"   # fd 3: read incoming messages from nc
+  exec 4>"$send_fifo"   # fd 4: write outgoing messages to nc
+
+  # Start nc in background: reads user input from send_fifo, writes incoming to recv_fifo
+  nc 127.0.0.1 "$p" < "$send_fifo" > "$recv_fifo" 2>/dev/null &
+  nc_pid=$!
+
+  # Wait for nc to connect (flushes history from tail -f)
+  sleep 0.5
+  if ! kill -0 "$nc_pid" 2>/dev/null; then
+    echo "error: could not connect to 127.0.0.1:$p" >&2
+    exec 3<&- 4>&- 2>/dev/null
+    rm -f "$send_fifo" "$recv_fifo"
+    exit 1
+  fi
+
+  # Main chat loop
+  while true; do
+    # Try reading an incoming message (non-blocking, 0.2s timeout)
+    local msg=""
+    if IFS= read -r -t 0.2 -u 3 msg 2>/dev/null; then
+      [[ -z "$msg" ]] && continue
+      printf '\n'   # Move off the current prompt line
+      display_message "$msg"
+      continue
+    fi
+
+    # No incoming message — read user input (with readline for history/arrows)
+    printf '> '
+    if ! IFS= read -r -e line; then
+      # EOF / Ctrl-D → quit
+      break
+    fi
+
+    # Handle quit command
+    if [[ "$line" == "/quit" ]]; then
+      break
+    fi
+
+    # Send tagged line to remote via nc (fd 4)
+    printf '[%s] %s\n' "$NAME" "$line" >&4
+  done
+
+  # Close FIFOs — nc gets EOF on its stdin and exits cleanly
+  exec 3<&- 4>&- 2>/dev/null || true
+  wait "$nc_pid" 2>/dev/null || true
+  kill "$tunnel_pid" 2>/dev/null || true
+  rm -f "$send_fifo" "$recv_fifo"
 }
 
 # ── modes ───────────────────────────────────────────────────────────────────
 connect_client() {            # laptop → box over ssh
   start_remote_listener
-  local TUNNEL=""
-  trap 'kill "${TUNNEL:-}" 2>/dev/null || true' EXIT INT TERM
   ssh -N -L "${PORT}:127.0.0.1:${PORT}" "$HOST" &
-  TUNNEL=$!
+  local TUNNEL=$!
   sleep 0.8
   echo "(connected to $HOST)"
-  chat_loop "$PORT"
+  chat_loop "$PORT" "$TUNNEL"
 }
 
 connect_here() {              # on the box itself, no ssh
