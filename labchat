@@ -90,77 +90,64 @@ display_message() {
 chat_loop() {
   local p="$1"
   local tunnel_pid="${2:-}"
-  local send_fifo="" recv_fifo=""
-  local nc_pid=""
-  local cleanup_done=0
+  local send_fifo=""
+  local reader_pid=""
+  # Not 'local' — trap closure captures outer scope, set -u would abort if
+  # referenced before local assignment (see gh #1 review).
+  _cleanup_done=0
 
-  # Create two FIFOs: one for sending to remote, one for receiving
+  # Create a FIFO for sending user input to the remote.
   send_fifo=$(mktemp -u /tmp/labchat-send-XXXXXX)
-  recv_fifo=$(mktemp -u /tmp/labchat-recv-XXXXXX)
-  mkfifo "$send_fifo" "$recv_fifo"
+  mkfifo "$send_fifo"
 
   # Cleanup handler (idempotent)
   cleanup() {
-    [ "$cleanup_done" = "1" ] && return
-    cleanup_done=1
-    kill "$nc_pid" 2>/dev/null || true
+    [ "$_cleanup_done" = "1" ] && return
+    _cleanup_done=1
+    kill "$reader_pid" 2>/dev/null || true
     kill "$tunnel_pid" 2>/dev/null || true
-    wait "$nc_pid" 2>/dev/null || true
-    rm -f "$send_fifo" "$recv_fifo"
+    wait "$reader_pid" 2>/dev/null || true
+    rm -f "$send_fifo"
   }
   trap cleanup INT TERM EXIT
 
   echo "── labchat: type to chat · /quit or Ctrl-C to leave ──"
 
-  # Open FIFOs as file descriptors
-  exec 3<"$recv_fifo"   # fd 3: read incoming messages from nc
-  exec 4>"$send_fifo"   # fd 4: write outgoing messages to nc
+  # ── FIX 1 & 4: Process substitution avoids FIFO ordering deadlock ───────
+  #  <(nc ...) opens the pipe's read end first (non-blocking), then forks nc
+  #  with stdin redirected to our send_fifo. We get fd 3 pointing at the
+  #  pipe's read end — nc's stdout goes through it. Background reader
+  #  consumes the pipe independently of the foreground read -e loop.
+  exec 3< <(nc 127.0.0.1 "$p" < "$send_fifo" 2>/dev/null)
 
-  # Start nc in background: reads user input from send_fifo, writes incoming to recv_fifo
-  nc 127.0.0.1 "$p" < "$send_fifo" > "$recv_fifo" 2>/dev/null &
-  nc_pid=$!
-
-  # Wait for nc to connect (flushes history from tail -f)
+  # Wait for nc to connect (flushes history from tail -f on the remote)
   sleep 0.5
-  if ! kill -0 "$nc_pid" 2>/dev/null; then
-    echo "error: could not connect to 127.0.0.1:$p" >&2
-    exec 3<&- 4>&- 2>/dev/null
-    rm -f "$send_fifo" "$recv_fifo"
-    exit 1
-  fi
 
-  # Main chat loop
-  while true; do
-    # Try reading an incoming message (non-blocking, 0.2s timeout)
-    local msg=""
-    if IFS= read -r -t 0.2 -u 3 msg 2>/dev/null; then
+  # ── True dual I/O: background reader for inbound, foreground for outbound ──
+  # Background reader reads from fd 3 (nc's output via pipe) and displays.
+  # Foreground loop does read -e for user input — no polling, no blocking.
+  _display_reader() {
+    while IFS= read -r -u 3 msg; do
       [[ -z "$msg" ]] && continue
       printf '\n'   # Move off the current prompt line
       display_message "$msg"
-      continue
-    fi
+    done
+  }
+  _display_reader &
+  reader_pid=$!
 
-    # No incoming message — read user input (with readline for history/arrows)
+  # ── FIX 3: Print prompt once per cycle (no spam) ────────────────────────
+  while true; do
     printf '> '
     if ! IFS= read -r -e line; then
       # EOF / Ctrl-D → quit
       break
     fi
-
-    # Handle quit command
-    if [[ "$line" == "/quit" ]]; then
-      break
-    fi
-
-    # Send tagged line to remote via nc (fd 4)
-    printf '[%s] %s\n' "$NAME" "$line" >&4
+    [[ "$line" == "/quit" ]] && break
+    printf '[%s] %s\n' "$NAME" "$line" > "$send_fifo"
   done
 
-  # Close FIFOs — nc gets EOF on its stdin and exits cleanly
-  exec 3<&- 4>&- 2>/dev/null || true
-  wait "$nc_pid" 2>/dev/null || true
-  kill "$tunnel_pid" 2>/dev/null || true
-  rm -f "$send_fifo" "$recv_fifo"
+  cleanup
 }
 
 # ── modes ───────────────────────────────────────────────────────────────────
