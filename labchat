@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# labchat — a live two-way text chat between two machines on a LAN, riding ssh.
+#
+# Same command on both ends:
+#   • On your laptop:  `labchat`        — connects to the remote over an ssh
+#                                          tunnel (loopback-only, encrypted).
+#   • On the box:      `labchat here`   — joins the same chat locally (no ssh).
+#
+# Both sides share an append-only "wall" file (~/.labchat-wall on the box).
+# Type a line, it appears on the other end. `/quit` or Ctrl-C leaves.
+#
+#   labchat              connect from a client (drives the remote over ssh)
+#   labchat here         join from the box itself (local, no ssh/tunnel)
+#   labchat serve        just start the local listener and exit (no chat)
+#   labchat stop         kill the local listener (use on the box)
+#   labchat status       is the listener up? (local if `here`, else remote)
+#   labchat say "text"   one-shot: push a line to the wall, no session
+#   labchat tail         one-shot: print the recent wall and exit
+#
+# Config via env: LABCHAT_HOST (ssh alias/host of the box, client mode),
+# LABCHAT_PORT, LABCHAT_NAME (tag for your lines). Needs `socat` on the box and
+# `nc` on the client. The listener does not survive a reboot — just reconnect.
+
+set -euo pipefail
+
+HOST="${LABCHAT_HOST:-cm64labs}"   # ssh alias/host of the box (client mode)
+PORT="${LABCHAT_PORT:-9999}"        # loopback port on the box (and local fwd)
+NAME="${LABCHAT_NAME:-$(hostname -s 2>/dev/null || echo me)}"  # tag for your lines
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPER_SRC="$SELF_DIR/labchatd.sh"
+WALL="$HOME/.labchat-wall"
+
+# ── helper: the per-connection handler the listener runs ────────────────────
+# In `here`/`serve` mode it's already next to us; in client mode we scp it over.
+helper_local() { printf '%s' "$HELPER_SRC"; }
+
+# ── starting a listener ─────────────────────────────────────────────────────
+# Start a socat listener bound to loopback that runs labchatd.sh per connection.
+# Used locally (here/serve) and remotely (client mode, over ssh). Idempotent.
+listener_cmd() {
+  cat <<'SH'
+set -e
+PORT="$1"; HELPER="$2"
+if ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
+  echo "listener already up on :$PORT"; exit 0
+fi
+chmod +x "$HELPER" 2>/dev/null || true
+# fork = multiple connections; loopback-only; setsid to outlive this shell.
+setsid socat TCP-LISTEN:"$PORT",bind=127.0.0.1,reuseaddr,fork \
+  EXEC:"$HELPER",pty,stderr >/dev/null 2>&1 < /dev/null &
+sleep 0.3
+echo "listener up on 127.0.0.1:$PORT"
+SH
+}
+
+start_local_listener() {
+  bash -c "$(listener_cmd)" _ "$PORT" "$(helper_local)"
+}
+
+start_remote_listener() {
+  scp -q "$HELPER_SRC" "$HOST:.labchatd.sh"
+  ssh "$HOST" bash -s -- "$PORT" '$HOME/.labchatd.sh' <<<"$(listener_cmd)"
+}
+
+# ── the chat loop: tag outgoing lines, pipe through nc to the listener ───────
+chat_loop() {  # $1 = port to nc into (already reachable locally)
+  local p="$1"
+  echo "── labchat: type to chat · /quit or Ctrl-C to leave ──"
+  { while IFS= read -r line; do
+      [ "$line" = "/quit" ] && break
+      printf '[%s] %s\n' "$NAME" "$line"
+    done } | nc 127.0.0.1 "$p"
+}
+
+# ── modes ───────────────────────────────────────────────────────────────────
+connect_client() {            # laptop → box over ssh
+  start_remote_listener
+  local TUNNEL=""
+  trap 'kill "${TUNNEL:-}" 2>/dev/null || true' EXIT INT TERM
+  ssh -N -L "${PORT}:127.0.0.1:${PORT}" "$HOST" &
+  TUNNEL=$!
+  sleep 0.8
+  echo "(connected to $HOST)"
+  chat_loop "$PORT"
+}
+
+connect_here() {              # on the box itself, no ssh
+  start_local_listener
+  echo "(local chat on $(hostname -s 2>/dev/null || echo this host))"
+  chat_loop "$PORT"
+}
+
+say_once() {                  # one-shot push to the wall (works either side)
+  if on_box; then
+    printf '[%s] %s\n' "$NAME" "$*" >> "$WALL"
+  else
+    scp -q "$HELPER_SRC" "$HOST:.labchatd.sh" 2>/dev/null || true
+    ssh "$HOST" 'cat >> ~/.labchat-wall' <<<"[$NAME] $*"
+  fi
+  echo "sent."
+}
+
+tail_once() {
+  if on_box; then touch "$WALL"; tail -n 30 "$WALL"
+  else ssh "$HOST" 'touch ~/.labchat-wall; tail -n 30 ~/.labchat-wall'; fi
+}
+
+status_listener() {
+  if on_box; then
+    ss -tlnH "sport = :$PORT" 2>/dev/null | grep -q LISTEN && echo "up on :$PORT (local)" || echo "down (local)"
+  else
+    ssh "$HOST" 'ss -tlnH "sport = :'"$PORT"'" 2>/dev/null | grep -q LISTEN && echo "up on :'"$PORT"' (remote)" || echo "down (remote)"'
+  fi
+}
+
+stop_listener() {
+  if on_box; then
+    pkill -f "TCP-LISTEN:$PORT" >/dev/null 2>&1 && echo "listener stopped" || echo "no listener running"
+  else
+    ssh "$HOST" 'pkill -f "TCP-LISTEN:'"$PORT"'" >/dev/null 2>&1 && echo "listener stopped" || echo "no listener running"'
+  fi
+}
+
+# on_box: true when we're running ON the box (set by `here`/`serve`).
+ON_BOX="${ON_BOX:-0}"
+on_box() { [ "$ON_BOX" = "1" ]; }
+
+case "${1:-connect}" in
+  connect|"") connect_client ;;
+  here)       ON_BOX=1; connect_here ;;
+  serve)      ON_BOX=1; start_local_listener ;;
+  stop)       stop_listener ;;
+  status)     status_listener ;;
+  say)        shift; say_once "$@" ;;
+  tail)       tail_once ;;
+  -h|--help)  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "usage: labchat [connect|here|serve|stop|status|say \"text\"|tail]" >&2; exit 1 ;;
+esac
