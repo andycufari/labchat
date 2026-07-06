@@ -1,137 +1,167 @@
 # labchat
 
-> A live two-way text chat between two machines on a LAN — riding the ssh
-> connection you already have. Same command on both ends. No email, no cloud,
-> no extra daemon to babysit.
+> A tiny desktop chat + file transfer between two of your own machines on the
+> same LAN — e.g. your Mac and your Kubuntu PC. No cloud, no accounts, no
+> daemon to babysit. Run the same app on both, point each at the other's LAN
+> IP, and only IPs on your allowlist can connect.
 
-You ssh into a box. You want to paste a snippet to it, or have it send a line
-back, without opening a mail client or a third-party service. `labchat` gives
-you a tiny live chat: type a line on either end, it appears on the other.
+You've got two computers on your desk (or your house). You want to fire a line
+of text or a file from one to the other without email, AirDrop-that-won't-see-
+Linux, or a USB stick. `labchat` is a small Python desktop window that does
+exactly that: **text both ways, files both ways, trusted IPs only.**
 
-It's two small shell scripts. The traffic never touches the open LAN in the
-clear — the listener binds to the **box's loopback**, and the client forwards
-that port through ssh. So it's as private as your ssh session, and there's no
-new port exposed to the network.
+It's a single file (`labchat-lan.py`) built on the Python standard library —
+nothing to `pip install`.
 
-## Two ends, one command
+## What it looks like
+
+```
+┌─ labchat-lan · mac · ● listening ──────────────┐
+│ · listening on :8765 — trusted: 192.168.1.42   │
+│ [mac] deploy done?                             │
+│ [kubuntu] yep, restarting now                  │
+│ [kubuntu] 📎 received: ~/Downloads/labchat/…    │
+│                                                │
+│ ┌────────────────────────┐ [Send] [📎 File] [⚙]│
+│ └────────────────────────┘                     │
+└────────────────────────────────────────────────┘
+```
+
+## Requirements
+
+- **Python 3** (already on macOS and Kubuntu).
+- **Tkinter** — ships with Python, but is a separate package on some systems:
+  - **macOS:** use the *system* Python at `/usr/bin/python3` (Homebrew's
+    Python often lacks Tk). Homebrew users can also `brew install python-tk`.
+  - **Kubuntu / Debian / Ubuntu:** `sudo apt install python3-tk`
+- Both machines on the **same LAN**, reachable by IP.
+
+No `pip`, no third-party libraries.
+
+## Install
+
+Just copy `labchat-lan.py` to **both** machines. That's it.
 
 ```sh
-# on your laptop — connects to the box over an ssh tunnel:
-labchat
-
-# on the box itself — joins the same chat locally, no ssh/tunnel:
-labchat here
+git clone git@github.com:andycufari/labchat.git
 ```
 
-Both see the same conversation:
+Optional — put it on your PATH so you can launch it from anywhere:
 
-```
-[mac] deploy done?
-[box] yep, restarting now
+```sh
+# macOS (system Python has Tk):
+echo '#!/bin/sh\nexec /usr/bin/python3 /path/to/labchat/labchat-lan.py "$@"' \
+  | sudo tee /usr/local/bin/labchat >/dev/null && sudo chmod +x /usr/local/bin/labchat
+
+# Kubuntu/Linux:
+echo '#!/bin/sh\nexec python3 /path/to/labchat/labchat-lan.py "$@"' \
+  | sudo tee /usr/local/bin/labchat >/dev/null && sudo chmod +x /usr/local/bin/labchat
 ```
 
-Install labchat on both machines (it's just two files). The laptop drives the
-box over ssh; the box joins its own local listener directly.
+## Usage
+
+1. **Find each machine's LAN IP:**
+   - macOS: `ipconfig getifaddr en0`  (or `en1` on Wi-Fi)
+   - Linux: `hostname -I`
+
+2. **Launch on both machines:**
+   ```sh
+   # macOS:
+   /usr/bin/python3 labchat-lan.py
+   # Kubuntu:
+   python3 labchat-lan.py
+   ```
+
+3. **First run — click ⚙ Settings on each machine and fill in:**
+   - **Your name** — the tag on your outgoing lines (e.g. `mac`, `kubuntu`).
+   - **Peer IP** — the *other* machine's LAN IP.
+   - **Allowlist** — add the *other* machine's IP so it's allowed to connect
+     in. (`127.0.0.1` is always trusted, for testing against yourself.)
+
+   Save on both. Restart the app once so it binds the listen port.
+
+4. **Chat.** Type + Enter (or **Send**) to send a line. Click **📎 File** to
+   send a file. Received files land in `~/Downloads/labchat/` (override with
+   `LABCHAT_DOWNLOADS`).
+
+### Example setup
+
+| | Mac (192.168.1.10) | Kubuntu (192.168.1.42) |
+|---|---|---|
+| Your name | `mac` | `kubuntu` |
+| Peer IP | `192.168.1.42` | `192.168.1.10` |
+| Allowlist | `192.168.1.42` | `192.168.1.10` |
+
+Both listen on `:8765` by default.
 
 ## How it works
 
 ```
-your machine                         remote box (e.g. a server you ssh into)
-────────────                         ──────────────────────────────────────
-  nc ──► 127.0.0.1:9999  ══ssh -L══►  127.0.0.1:9999  ──► socat (fork)
-                                                            │  per connection:
-                                                            ├─ tail -f ~/.labchat-wall  (you SEE this)
-                                                            └─ append stdin ►► ~/.labchat-wall  (you SEND this)
+Mac                                  Kubuntu
+───                                  ───────
+labchat-lan.py                       labchat-lan.py
+  ├─ listener  :8765  ◄──TCP (LAN)──   dials peer 192.168.1.10:8765
+  │   accepts ONLY allowlisted IPs
+  └─ dials peer 192.168.1.42:8765 ──►  listener :8765 (allowlist checked)
 ```
 
-- A shared **wall** file (`~/.labchat-wall` on the remote) is the conversation.
-- Each connection streams the tail of the wall to you (history + anything
-  anyone types) and appends what you type back into it.
-- Because it's append-only to one file, **multiple people/sessions** can join
-  the same wall and all see each other.
-
-## Requirements
-
-- `ssh` access from the client to the box (a `~/.ssh/config` entry is easiest).
-- `socat` on the **box** (`sudo apt install socat` on Debian/Ubuntu).
-- `nc` on both ends (preinstalled on macOS and most Linux).
-- `bash` on both ends.
-
-## Install
-
-Install on **both** machines (it's two small files):
-
-```sh
-git clone git@github.com:andycufari/labchat.git
-cd labchat
-chmod +x labchat labchatd.sh
-ln -s "$PWD/labchat" /usr/local/bin/labchat     # put it on PATH
-```
-
-When you connect as a client, `labchatd.sh` (the per-connection handler) is also
-copied to the box automatically — but having labchat on the box lets you run
-`labchat here` for the nice local chat UX.
-
-## Usage
-
-**From the client (laptop)** — point at the box and connect over ssh:
-
-```sh
-export LABCHAT_HOST=myserver        # ssh alias, or user@1.2.3.4
-labchat                             # starts the box listener, opens the chat
-```
-
-**On the box** — join the same chat locally (no ssh, no tunnel):
-
-```sh
-labchat here
-```
-
-Now type on either side. Lines are tagged with each host's name; `/quit` or
-Ctrl-C leaves. The listener keeps running for the next session — stop it
-explicitly with `labchat stop` (run that on the box, or from the client to stop
-the remote one).
-
-### One-shot, no session
-
-```sh
-labchat say "deploy finished, logs in /var/log/app"   # push one line to the wall
-labchat tail                                          # print the last 30 lines and exit
-```
-
-(`say`/`tail`/`status`/`stop` act on the box from the client, or locally when
-run on the box.)
-
-### Just run a listener
-
-```sh
-labchat serve     # on the box: start the listener and exit (no interactive chat)
-labchat status    # up on :9999  /  down
-labchat stop      # kill the listener
-```
+- Each app runs a **listener thread** on its port and **dials the peer** when
+  you send. Fully symmetric — either side can start a message or a file.
+- One **JSON object per line** over TCP is the whole protocol. Text and files
+  share the same channel; a file rides as base64 with a SHA-256 checksum, so a
+  truncated or corrupt transfer is dropped rather than written.
+- **Every inbound connection's source IP is checked against your allowlist**
+  before a single byte is read. Anything not on the list is refused and logged.
 
 ## Configuration
 
-All via environment variables:
+Stored in `~/.labchat-lan.json` (edit in-app via ⚙, or by hand):
 
-| Var            | Default                | Meaning                                   |
-|----------------|------------------------|-------------------------------------------|
-| `LABCHAT_HOST` | `cm64labs`             | ssh alias or `user@host` of the remote    |
-| `LABCHAT_PORT` | `9999`                 | loopback port on the remote (+ local fwd) |
-| `LABCHAT_NAME` | your short hostname    | tag prefixed to your outgoing lines       |
+```json
+{
+  "name": "mac",
+  "listen_port": 8765,
+  "peer_host": "192.168.1.42",
+  "peer_port": 8765,
+  "allowlist": ["127.0.0.1", "192.168.1.42"]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `name` | tag prefixed to your outgoing lines |
+| `listen_port` | port this machine listens on |
+| `peer_host` / `peer_port` | the other machine's LAN IP + port |
+| `allowlist` | inbound IPs allowed to connect (`127.0.0.1` always trusted) |
+
+Env: `LABCHAT_DOWNLOADS` overrides where received files are saved.
 
 ## Notes & caveats
 
-- **Privacy:** the chat rides ssh; the listener is loopback-only on the remote.
-  Nothing is exposed on the LAN. It's as private as your ssh connection.
-- **Persistence:** the listener does not survive a remote reboot. Just run
-  `labchat` again — it relinks and re-installs the handler if needed.
-- **Not encrypted at rest:** the wall is a plain file in the remote's home dir.
-  Don't paste secrets you wouldn't leave in a file there. `rm ~/.labchat-wall`
-  to wipe the history.
-- **One wall per remote:** everyone who connects to the same remote shares one
-  conversation. Use `LABCHAT_PORT` + a separate wall if you want isolated rooms
-  (currently the wall path is fixed; PRs welcome).
+- **Trust model:** the allowlist is your gate. Only put IPs you control on it.
+  Traffic on the LAN is **not encrypted** — this is for your own machines on
+  your own network, not for sending secrets across an untrusted network. If you
+  need encryption between two boxes, use the ssh-tunnel variant below.
+- **Firewall:** on first run macOS may ask to allow incoming connections for
+  Python — say yes. On Linux, if it can't connect, check `ufw`/firewalld.
+- **File size:** capped at 200 MB per file (it's base64-in-memory; fine for the
+  files you hand-move, not a bulk sync tool). Files never overwrite — a repeat
+  name becomes `x (1).ext`.
+- **Static IPs help:** if your router hands out new IPs, update Peer IP +
+  allowlist, or reserve a DHCP lease per machine.
+
+## The ssh-tunnel variant (original labchat)
+
+The repo also ships the original **terminal, ssh-tunnel** version — `labchat`
+(bash) + `labchatd.sh`. Use that when the two machines are *not* peers on a
+trusted LAN but boxes you `ssh` into, and you want the chat encrypted over the
+ssh connection with nothing exposed on the network. It's text-only. See the
+header comments in `labchat` for its usage (`labchat`, `labchat here`,
+`labchat say "…"`, `labchat tail`).
+
+Rule of thumb:
+- **Two of your own machines on your LAN, want a window + files** → `labchat-lan.py`.
+- **A remote server you ssh into, want text over the encrypted tunnel** → `labchat`.
 
 ## License
 

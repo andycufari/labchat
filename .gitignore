@@ -1,3 +1,8 @@
 .labchat-wall
 *.swp
 .DS_Store
+__pycache__/
+*.pyc
+icon-1024.png
+icon.iconset/
+.labchat-lan.json
